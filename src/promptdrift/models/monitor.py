@@ -26,6 +26,16 @@ Diagnosis = Literal[
 ]
 
 
+class SampleResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int = Field(ge=1)
+    status: Literal["PASS", "WARN", "FAIL", "ERROR"]
+    output_hash: str | None = None
+    latency_ms: float | None = Field(default=None, ge=0)
+    failed_assertions: list[str] = Field(default_factory=list)
+
+
 class MonitorCase(BaseModel):
     model_config = ConfigDict(extra="forbid")
     test_id: str
@@ -41,6 +51,7 @@ class MonitorCase(BaseModel):
     assertions: dict[str, bool] = Field(default_factory=dict)
     metrics: dict[str, float | int | None] = Field(default_factory=dict)
     provenance: Provenance | None = None
+    samples_detail: list[SampleResult] = Field(default_factory=list)
 
 
 class MonitorReport(BaseModel):

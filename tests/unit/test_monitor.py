@@ -21,10 +21,16 @@ from promptdrift.errors import (
     TemplateError,
 )
 from promptdrift.models import Config
+from promptdrift.models.monitor import MonitorCase, MonitorReport, SampleResult
 from promptdrift.models.result import ModelResponse
 from promptdrift.models.test import Assertion
 from promptdrift.providers.mock import MockProvider
-from promptdrift.storage.history import history_path, load_monitor_history, save_monitor_report
+from promptdrift.storage.history import (
+    history_path,
+    load_monitor_history,
+    load_monitor_run_by_id,
+    save_monitor_report,
+)
 
 
 @pytest.fixture
@@ -615,3 +621,480 @@ def test_cli_history_reports_invalid_config(tmp_path):
     result = CliRunner().invoke(app, ["history", "-c", str(path), "--json"])
     assert result.exit_code == 2
     assert "greater than or equal to 0" in result.output
+
+
+class TestSampleResultModel:
+    def test_sample_result_valid(self):
+        sample = SampleResult(
+            index=1,
+            status="PASS",
+            output_hash="abc12345",
+            latency_ms=12.5,
+            failed_assertions=[],
+        )
+        assert sample.index == 1
+        assert sample.status == "PASS"
+        assert sample.output_hash == "abc12345"
+        assert sample.latency_ms == 12.5
+        assert sample.failed_assertions == []
+
+    def test_sample_result_defaults(self):
+        sample = SampleResult(index=1, status="PASS")
+        assert sample.output_hash is None
+        assert sample.latency_ms is None
+        assert sample.failed_assertions == []
+
+    def test_sample_result_mutable_default_is_independent(self):
+        s1 = SampleResult(index=1, status="PASS")
+        s2 = SampleResult(index=2, status="PASS")
+        s1.failed_assertions.append("failed_one")
+        assert s2.failed_assertions == []
+
+    @pytest.mark.parametrize("invalid_index", [0, -1, -5])
+    def test_sample_result_rejects_non_positive_index(self, invalid_index):
+        with pytest.raises(Exception):
+            SampleResult(index=invalid_index, status="PASS")
+
+    @pytest.mark.parametrize("invalid_status", ["UNKNOWN", "pass", "fail", "ERROR_CODE", ""])
+    def test_sample_result_rejects_invalid_status(self, invalid_status):
+        with pytest.raises(Exception):
+            SampleResult(index=1, status=invalid_status)
+
+    def test_sample_result_rejects_negative_latency(self):
+        with pytest.raises(Exception):
+            SampleResult(index=1, status="PASS", latency_ms=-1.0)
+
+    def test_sample_result_rejects_extra_fields(self):
+        with pytest.raises(Exception):
+            SampleResult(index=1, status="PASS", raw_output="leak")
+
+    def test_monitor_case_defaults_samples_detail_empty(self):
+        case = MonitorCase(
+            test_id="t1",
+            status="PASS",
+            diagnosis="stable",
+            summary="ok",
+            samples=1,
+        )
+        assert case.samples_detail == []
+
+
+class TestMonitorPerSampleEvidence:
+    def test_monitor_suite_mixed_stochastic_evidence(self, monitored, monkeypatch):
+        import hashlib
+
+        config, path = monitored
+        # 3 samples: 1 passing, 1 failing, 1 provider error
+        outputs = ["30 days", "denied", ProviderError("network timeout")]
+        responses(monkeypatch, outputs)
+        report = monitor_suite(config, path, samples=3)
+        assert len(report.tests) == 1
+        case = report.tests[0]
+
+        # Aggregate diagnostics and counters are preserved
+        assert case.diagnosis == "provider_error"
+        assert case.status == "ERROR"
+        assert case.samples == 3
+        assert case.failures == 1
+        assert case.provider_errors == 1
+        assert len(case.samples_detail) == 3
+
+        # Sample 1: PASS
+        s1 = case.samples_detail[0]
+        assert s1.index == 1
+        assert s1.status == "PASS"
+        assert s1.output_hash == hashlib.sha256(b"30 days").hexdigest()
+        assert s1.latency_ms == 1
+        assert s1.failed_assertions == []
+
+        # Sample 2: FAIL
+        s2 = case.samples_detail[1]
+        assert s2.index == 2
+        assert s2.status == "FAIL"
+        assert s2.output_hash == hashlib.sha256(b"denied").hexdigest()
+        assert s2.latency_ms == 1
+        assert s2.failed_assertions == ["contains"]
+
+        # Sample 3: ERROR
+        s3 = case.samples_detail[2]
+        assert s3.index == 3
+        assert s3.status == "ERROR"
+        assert s3.output_hash is None
+        assert s3.latency_ms is None
+        assert s3.failed_assertions == []
+
+    def test_monitor_suite_warn_status_evidence(self, tmp_path, monkeypatch):
+        import hashlib
+
+        config = Config.model_validate(
+            {
+                "provider": {"type": "mock", "model": "echo"},
+                "tests": [
+                    {
+                        "id": "warn_case",
+                        "prompt": "prompt.txt",
+                        "assertions": [
+                            {"type": "contains", "value": "must_have", "severity": "warn"}
+                        ],
+                    }
+                ],
+            }
+        )
+        path = tmp_path / "promptdrift.yaml"
+        (tmp_path / "prompt.txt").write_text("hello", encoding="utf-8")
+        path.write_text(json.dumps(config.model_dump(mode="json")), encoding="utf-8")
+        write_baseline(tmp_path / config.baseline.path, run_suite(config, path))
+
+        outputs = ["no match"]
+        responses(monkeypatch, outputs)
+        report = monitor_suite(config, path, samples=1)
+        case = report.tests[0]
+
+        assert len(case.samples_detail) == 1
+        s = case.samples_detail[0]
+        assert s.index == 1
+        assert s.status == "WARN"
+        assert s.output_hash == hashlib.sha256(b"no match").hexdigest()
+        assert s.failed_assertions == ["contains"]
+
+    def test_monitor_suite_missing_baseline_case_empty_samples_detail(self, tmp_path):
+        # A test present in baseline but missing from active config
+        active_config = Config.model_validate(
+            {
+                "provider": {"type": "mock", "model": "echo"},
+                "tests": [
+                    {
+                        "id": "remaining_test",
+                        "prompt": "prompt.txt",
+                    }
+                ],
+            }
+        )
+        path = tmp_path / "promptdrift.yaml"
+        (tmp_path / "prompt.txt").write_text("hello", encoding="utf-8")
+        path.write_text(json.dumps(active_config.model_dump(mode="json")), encoding="utf-8")
+
+        baseline_config = Config.model_validate(
+            {
+                "provider": {"type": "mock", "model": "echo"},
+                "tests": [
+                    {
+                        "id": "remaining_test",
+                        "prompt": "prompt.txt",
+                    },
+                    {
+                        "id": "removed_test",
+                        "prompt": "prompt.txt",
+                    },
+                ],
+            }
+        )
+        write_baseline(tmp_path / active_config.baseline.path, run_suite(baseline_config, path))
+
+        report = monitor_suite(active_config, path, samples=2)
+        assert len(report.tests) == 2
+        removed_case = next(c for c in report.tests if c.test_id == "removed_test")
+        assert removed_case.samples == 0
+        assert removed_case.samples_detail == []
+
+
+class TestMonitorReportPrinting:
+    def test_terminal_report_displays_samples_detail_for_non_stable(self):
+        from io import StringIO
+
+        from rich.console import Console
+
+        from promptdrift.reports.monitor import print_monitor_report
+
+        report = MonitorReport(
+            provider="mock",
+            model="echo",
+            samples=2,
+            baseline_path="baseline.json",
+            tests=[
+                MonitorCase(
+                    test_id="drifted_case",
+                    status="FAIL",
+                    diagnosis="stochastic_behavior",
+                    summary="Behavior varies",
+                    samples=2,
+                    failures=1,
+                    evidence=["probe 1 passed, probe 2 failed"],
+                    samples_detail=[
+                        SampleResult(
+                            index=1,
+                            status="PASS",
+                            output_hash="abcdef0123456789abcdef",
+                            latency_ms=10.0,
+                        ),
+                        SampleResult(
+                            index=2,
+                            status="FAIL",
+                            output_hash="9876543210fedcba987654",
+                            latency_ms=12.0,
+                            failed_assertions=["contains"],
+                        ),
+                    ],
+                )
+            ],
+        )
+
+        stream = StringIO()
+        console = Console(file=stream, color_system=None, width=120)
+        print_monitor_report(report, console)
+        output = stream.getvalue()
+
+        assert "Sample Evidence: drifted_case" in output
+        assert "abcdef01" in output
+        assert "abcdef0123456789abcdef" not in output
+        assert "98765432" in output
+        assert "1" in output
+        assert "2" in output
+        assert "PASS" in output
+        assert "FAIL" in output
+
+    def test_terminal_report_hyphen_when_hash_none(self):
+        from io import StringIO
+
+        from rich.console import Console
+
+        from promptdrift.reports.monitor import print_monitor_report
+
+        report = MonitorReport(
+            provider="mock",
+            model="echo",
+            samples=1,
+            baseline_path="baseline.json",
+            tests=[
+                MonitorCase(
+                    test_id="error_case",
+                    status="ERROR",
+                    diagnosis="provider_error",
+                    summary="Provider call failed",
+                    samples=1,
+                    provider_errors=1,
+                    samples_detail=[
+                        SampleResult(
+                            index=1,
+                            status="ERROR",
+                            output_hash=None,
+                            latency_ms=None,
+                        ),
+                    ],
+                )
+            ],
+        )
+
+        stream = StringIO()
+        console = Console(file=stream, color_system=None, width=120)
+        print_monitor_report(report, console)
+        output = stream.getvalue()
+
+        assert "Sample Evidence: error_case" in output
+        assert "-" in output
+        assert "ERROR" in output
+
+    def test_terminal_report_does_not_display_table_for_stable(self):
+        from io import StringIO
+
+        from rich.console import Console
+
+        from promptdrift.reports.monitor import print_monitor_report
+
+        report = MonitorReport(
+            provider="mock",
+            model="echo",
+            samples=1,
+            baseline_path="baseline.json",
+            tests=[
+                MonitorCase(
+                    test_id="stable_case",
+                    status="PASS",
+                    diagnosis="stable",
+                    summary="All probes passed",
+                    samples=1,
+                    samples_detail=[
+                        SampleResult(
+                            index=1,
+                            status="PASS",
+                            output_hash="abcdef0123456789",
+                            latency_ms=10.0,
+                        ),
+                    ],
+                )
+            ],
+        )
+
+        stream = StringIO()
+        console = Console(file=stream, color_system=None, width=120)
+        print_monitor_report(report, console)
+        output = stream.getvalue()
+
+        assert "Sample Evidence: stable_case" not in output
+
+    def test_terminal_report_does_not_display_table_for_empty_samples_detail(self):
+        from io import StringIO
+
+        from rich.console import Console
+
+        from promptdrift.reports.monitor import print_monitor_report
+
+        report = MonitorReport(
+            provider="mock",
+            model="echo",
+            samples=0,
+            baseline_path="baseline.json",
+            tests=[
+                MonitorCase(
+                    test_id="removed_case",
+                    status="WARN",
+                    diagnosis="insufficient_evidence",
+                    summary="Removed case",
+                    samples=0,
+                    samples_detail=[],
+                )
+            ],
+        )
+
+        stream = StringIO()
+        console = Console(file=stream, color_system=None, width=120)
+        print_monitor_report(report, console)
+        output = stream.getvalue()
+
+        assert "Sample Evidence: removed_case" not in output
+
+
+class TestMonitorBackwardCompatibilityAndPrivacy:
+    def test_backward_compatibility_deserialization_without_samples_detail(self):
+        legacy_json = json.dumps(
+            {
+                "test_id": "legacy_test",
+                "status": "PASS",
+                "diagnosis": "stable",
+                "summary": "all ok",
+                "samples": 2,
+                "failures": 0,
+                "provider_errors": 0,
+                "output_changes": 0,
+                "evidence": [],
+                "output_hash": "hash123",
+                "assertions": {"contains": True},
+                "metrics": {"latency_ms": 50},
+                "provenance": None,
+            }
+        )
+        case = MonitorCase.model_validate_json(legacy_json)
+        assert case.test_id == "legacy_test"
+        assert case.samples_detail == []
+
+    def test_sqlite_history_with_and_without_samples_detail(self, tmp_path):
+        db_path = tmp_path / "history.sqlite3"
+        # 1. Save legacy report without samples_detail
+        legacy_report_dict = {
+            "schema_version": 1,
+            "run_id": "run-legacy",
+            "generated_at": "2026-11-16T12:00:00Z",
+            "provider": "mock",
+            "model": "echo",
+            "samples": 1,
+            "baseline_path": "baseline.json",
+            "warnings": [],
+            "tests": [
+                {
+                    "test_id": "test1",
+                    "status": "PASS",
+                    "diagnosis": "stable",
+                    "summary": "ok",
+                    "samples": 1,
+                    "failures": 0,
+                    "provider_errors": 0,
+                    "output_changes": 0,
+                    "evidence": [],
+                    "output_hash": "abc",
+                    "assertions": {},
+                    "metrics": {},
+                    "provenance": None,
+                }
+            ],
+        }
+        # Save via raw SQLite insert into monitor_runs table
+        with sqlite3.connect(db_path) as db:
+            db.execute("PRAGMA user_version = 1")
+            db.execute(
+                "CREATE TABLE monitor_runs (run_id TEXT PRIMARY KEY, report_json TEXT NOT NULL)"
+            )
+            db.execute(
+                "INSERT INTO monitor_runs (run_id, report_json) VALUES (?, ?)",
+                ("run-legacy", json.dumps(legacy_report_dict)),
+            )
+
+        # Verify load_monitor_history can load it seamlessly
+        history = load_monitor_history(db_path)
+        assert len(history) == 1
+        loaded_legacy_report = MonitorReport.model_validate(history[0])
+        assert loaded_legacy_report.tests[0].samples_detail == []
+
+        # 2. Save new report with samples_detail using save_monitor_report
+        new_report = MonitorReport(
+            provider="mock",
+            model="echo",
+            samples=1,
+            baseline_path="baseline.json",
+            tests=[
+                MonitorCase(
+                    test_id="test2",
+                    status="FAIL",
+                    diagnosis="stochastic_behavior",
+                    summary="failed",
+                    samples=1,
+                    failures=1,
+                    samples_detail=[
+                        SampleResult(
+                            index=1,
+                            status="FAIL",
+                            output_hash="hash2",
+                            latency_ms=15.0,
+                            failed_assertions=["assertion_x"],
+                        )
+                    ],
+                )
+            ],
+        )
+        save_monitor_report(new_report, db_path)
+
+        # Verify both runs are present and valid
+        history2 = load_monitor_history(db_path)
+        assert len(history2) == 2
+        # Load via load_monitor_run_by_id to test full MonitorReport deserialization
+        loaded_legacy_run = load_monitor_run_by_id(db_path, "run-legacy")
+        assert loaded_legacy_run.tests[0].samples_detail == []
+
+        loaded_new_run = load_monitor_run_by_id(db_path, new_report.run_id)
+        assert len(loaded_new_run.tests[0].samples_detail) == 1
+        assert loaded_new_run.tests[0].samples_detail[0].index == 1
+        assert loaded_new_run.tests[0].samples_detail[0].status == "FAIL"
+        assert loaded_new_run.tests[0].samples_detail[0].failed_assertions == ["assertion_x"]
+
+    def test_no_raw_prompt_or_output_leakage_in_samples_detail(self, monitored, monkeypatch):
+        config, path = monitored
+        secret_output = "SUPER_SECRET_MODEL_OUTPUT_12345"
+        secret_prompt = "CONFIDENTIAL_USER_PROMPT_67890"
+
+        # Update test prompt file with secret text
+        (path.parent / "policy.txt").write_text(secret_prompt + " {{ days }}", encoding="utf-8")
+        write_baseline(path.parent / config.baseline.path, run_suite(config, path), force=True)
+
+        responses(monkeypatch, [secret_output])
+        report = monitor_suite(config, path, samples=1)
+        serialized = report.model_dump_json()
+
+        assert secret_output not in serialized
+        assert secret_prompt not in serialized
+        assert len(report.tests[0].samples_detail) == 1
+        assert report.tests[0].samples_detail[0].output_hash is not None
+        # Verify that SampleResult schema itself doesn't contain prompt/output fields
+        sample_dict = report.tests[0].samples_detail[0].model_dump()
+        assert "prompt" not in sample_dict
+        assert "output" not in sample_dict
+        assert "raw_prompt" not in sample_dict
+        assert "raw_output" not in sample_dict

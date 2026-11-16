@@ -20,6 +20,15 @@ def print_monitor_report(report: MonitorReport, console: Console) -> None:
             console.print(f"{test.test_id}: {test.summary}", markup=False)
             for item in test.evidence:
                 console.print(f"  - {item}", markup=False)
+            if test.samples_detail:
+                detail_table = Table(title=f"Sample Evidence: {test.test_id}")
+                detail_table.add_column("Sample")
+                detail_table.add_column("Status")
+                detail_table.add_column("Output Hash")
+                for sample in test.samples_detail:
+                    hash_display = sample.output_hash[:8] if sample.output_hash else "-"
+                    detail_table.add_row(str(sample.index), sample.status, hash_display)
+                console.print(detail_table)
     for warning in report.warnings:
         console.print(f"Warning: {warning}", markup=False)
     console.print("Observations are not proof of a vendor model update. Baseline was not modified.")

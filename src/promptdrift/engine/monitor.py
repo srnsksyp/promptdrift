@@ -16,7 +16,7 @@ from promptdrift.engine.runner import evaluate_response, evaluation_status
 from promptdrift.engine.suite import resolve_suite
 from promptdrift.errors import ConfigError, ProviderBudgetExceededError, ProviderError
 from promptdrift.models import BaselineTest, Config, TestCase
-from promptdrift.models.monitor import Diagnosis, MonitorCase, MonitorReport
+from promptdrift.models.monitor import Diagnosis, MonitorCase, MonitorReport, SampleResult
 from promptdrift.models.provenance import Provenance
 from promptdrift.providers import create_provider
 from promptdrift.storage.snapshots import save_snapshot, snapshot_from_report
@@ -164,7 +164,8 @@ def monitor_suite(
         observed_assertions: dict[str, bool] = {}
         observed_metrics: dict[str, float | int | None] = {}
         observed_provenance: Provenance | None = None
-        for _ in range(samples):
+        samples_detail: list[SampleResult] = []
+        for sample_index in range(1, samples + 1):
             try:
                 response = provider.complete(
                     prompt,
@@ -173,6 +174,15 @@ def monitor_suite(
                 )
             except ProviderError:
                 errors += 1
+                samples_detail.append(
+                    SampleResult(
+                        index=sample_index,
+                        status="ERROR",
+                        output_hash=None,
+                        latency_ms=None,
+                        failed_assertions=[],
+                    )
+                )
                 continue
             evaluations = evaluate_response(test, response)
             status = evaluation_status(evaluations)
@@ -186,6 +196,18 @@ def monitor_suite(
             ) or (test.output.format == "json" and not evaluations[len(test.assertions)].passed)
             observed = with_response(provenance, response)
             observed_output_hash = hashlib.sha256(response.output.encode()).hexdigest()
+            failed_assertions = [
+                evaluation.assertion for evaluation in evaluations if not evaluation.passed
+            ]
+            samples_detail.append(
+                SampleResult(
+                    index=sample_index,
+                    status=status,
+                    output_hash=observed_output_hash,
+                    latency_ms=response.latency_ms,
+                    failed_assertions=failed_assertions,
+                )
+            )
             observed_assertions = {
                 evaluation.assertion: evaluation.passed for evaluation in evaluations
             }
@@ -253,6 +275,7 @@ def monitor_suite(
                 assertions=observed_assertions,
                 metrics=observed_metrics,
                 provenance=observed_provenance,
+                samples_detail=samples_detail,
             )
         )
     for missing in sorted(set(baseline.tests) - {test.id for test in active.tests}):
@@ -263,6 +286,7 @@ def monitor_suite(
                 diagnosis="insufficient_evidence",
                 samples=0,
                 summary="Accepted case is absent from the active suite; monitoring coverage was removed.",
+                samples_detail=[],
             )
         )
     report = MonitorReport(
